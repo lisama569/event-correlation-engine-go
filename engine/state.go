@@ -22,15 +22,40 @@ type windowState struct {
 	seen    map[string]struct{} // 事件 ID 去重，防止重复计数
 }
 
-// keyState 单个关联键（ruleID|groupKey）的窗口状态集合。
+// keyState 单个关联键（ruleset版本|ruleID|groupKey）的窗口状态集合。
+// 元数据在创建时从当版规则快照固化，后续规则热更新不会改写已开启窗口的判定依据。
 type keyState struct {
-	stateKey string
-	windows  map[int64]*windowState // windowStart.UnixNano() -> 状态
-	elem     *list.Element          // 在 LRU 链表中的位置
+	stateKey    string
+	ruleID      string                 // 规则 ID
+	ruleVersion int                    // 开启时使用的规则集版本
+	groupKey    string                 // 关联键（group_by 值）
+	windowNanos int64                  // 当版规则的窗口长度
+	threshold   int                    // 当版规则的阈值
+	windows     map[int64]*windowState // windowStart.UnixNano() -> 状态
+	elem        *list.Element          // 在 LRU 链表中的位置
 }
 
-func newKeyState(stateKey string) *keyState {
-	return &keyState{stateKey: stateKey, windows: make(map[int64]*windowState)}
+func newKeyState(stateKey, ruleID string, ruleVersion int, groupKey string, windowNanos int64, threshold int) *keyState {
+	return &keyState{
+		stateKey:    stateKey,
+		ruleID:      ruleID,
+		ruleVersion: ruleVersion,
+		groupKey:    groupKey,
+		windowNanos: windowNanos,
+		threshold:   threshold,
+		windows:     make(map[int64]*windowState),
+	}
+}
+
+// unsettled 返回尚未触发告警且已有计数的窗口（结算时可能丢失/待收尾的部分）。
+func (ks *keyState) unsettled() map[int64]*windowState {
+	out := make(map[int64]*windowState)
+	for start, ws := range ks.windows {
+		if !ws.alerted && ws.count > 0 {
+			out[start] = ws
+		}
+	}
+	return out
 }
 
 // add 在指定窗口中加入一个事件，返回 (新增计数, 是否重复)。

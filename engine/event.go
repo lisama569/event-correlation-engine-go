@@ -27,3 +27,15 @@ type LateEvent struct {
 	Watermark int64  `json:"watermark"` // 当前水位（UnixNano）
 	Reason    string `json:"reason"`
 }
+
+// EvictionReport 关联状态被内存上限淘汰时的报告。
+// 已确认告警在计数达阈值时已即时触发，不在淘汰损失范围内；
+// 报告暴露的是被淘汰时仍未结算的窗口，便于事后判断有没有漏判。
+type EvictionReport struct {
+	RuleID         string `json:"rule_id"`
+	RuleVersion    int    `json:"rule_version"` // 状态开启时使用的规则集版本
+	Key            string `json:"key"`          // 关联键（group_by 值）
+	PendingWindows int    `json:"pending_windows"`
+	DroppedEvents  int    `json:"dropped_events"`
+	Reason         string `json:"reason"`
+}
