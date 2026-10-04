@@ -172,3 +172,68 @@ func TestConcurrentHotReload(t *testing.T) {
 	t.Logf("concurrent reload done: alerts=%d lates=%d final_rules_version=%d",
 		len(e.Alerts()), len(e.LateEvents()), e.RulesVersion())
 }
+
+// 运行中切换规则版本：已开启的窗口必须始终按它开启时那一版规则判定，
+// 阈值、窗口长度、累计计数不被新版本改写；新版本只对切版本之后开启的新窗口生效。
+func TestVersionPinningAcrossReload(t *testing.T) {
+	// v1：阈值 5，窗口 10m；v2：阈值 2，窗口 5m（同一规则 id、同一 group_by）。
+	rsV1 := loadRules(t, `{"version":1,"rules":[
+	  {"id":"login-fail","match":[{"field":"type","op":"eq","value":"login_fail"}],"window":"10m","threshold":5,"field":"src_ip"}
+	]}`)
+	rsV2 := loadRules(t, `{"version":2,"rules":[
+	  {"id":"login-fail","match":[{"field":"type","op":"eq","value":"login_fail"}],"window":"5m","threshold":2,"group_by":"src_ip","severity":"high"}
+	]}`)
+
+	e, _ := New(Config{AllowedLateness: 0, MaxKeys: 64}, rsV1)
+	f := map[string]string{"type": "login_fail", "src_ip": "9.9.9.9"}
+
+	// 在 v1 下开启窗口 [00:00,00:10)，只来 1 条（阈值 5，不触发）。
+	logAlerts(t, ev("p1", 30*time.Second, f), e.Process(ev("p1", 30*time.Second, f)))
+
+	// 热更新到 v2：阈值降到 2、窗口缩到 5m。
+	if err := e.Reload(rsV2); err != nil {
+		t.Fatal(err)
+	}
+	if v := e.RulesVersion(); v != 2 {
+		t.Fatalf("rules version=%d want 2", v)
+	}
+
+	// 继续往旧窗口（按 10m 对齐）补事件到 count=4。若新旧混算，count=2 时就会按 v2 阈值告警。
+	for i, off := range []time.Duration{1 * time.Minute, 2 * time.Minute, 3 * time.Minute} {
+		id := fmt.Sprintf("p%d", i+2)
+		logAlerts(t, ev(id, off, f), e.Process(ev(id, off, f)))
+	}
+	if got := len(e.Alerts()); got != 0 {
+		t.Fatalf("old window got alerts under v2 threshold (mixed versions!): %d %+v", got, e.Alerts())
+	}
+
+	// 第 5 条（4m30s，truncate 到 5m 仍是 0，故复用旧 v1 窗口 start=0）满足固定 v1 阈值 5；
+	// 告警必须归属于 v1，且判定依据是 threshold=5、窗口 10m。
+	trigger := 4*time.Minute + 30*time.Second
+	a := e.Process(ev("p5", trigger, f))
+	logAlerts(t, ev("p5", trigger, f), a)
+	if len(a) != 1 {
+		t.Fatalf("want exactly 1 alert at count=5, got %d", len(a))
+	}
+	if a[0].RuleVersion != 1 {
+		t.Fatalf("alert version=%d want 1 (pinned at window open)", a[0].RuleVersion)
+	}
+	if a[0].Count != 5 || a[0].WindowEnd.Sub(a[0].WindowStart) != 10*time.Minute {
+		t.Fatalf("window must keep v1 threshold=5 window=10m, got count=%d span=%v reason=%q",
+			a[0].Count, a[0].WindowEnd.Sub(a[0].WindowStart), a[0].Reason)
+	}
+
+	// 切版本之后开启的新窗口：v2 窗口长度 5m、阈值 2，6m/7m 事件 truncate 到同一 5m 窗口。
+	n1 := ev("n1", 6*time.Minute, f)
+	logAlerts(t, n1, e.Process(n1))
+	n2 := ev("n2", 7*time.Minute, f)
+	newAlerts := e.Process(n2)
+	logAlerts(t, n2, newAlerts)
+	if len(newAlerts) != 1 || newAlerts[0].RuleVersion != 2 || newAlerts[0].Count != 2 {
+		t.Fatalf("new window must fire by v2 threshold=2 as version 2, got %+v", newAlerts)
+	}
+	if newAlerts[0].WindowEnd.Sub(newAlerts[0].WindowStart) != 5*time.Minute {
+		t.Fatalf("new window must use v2 window=5m, got span=%v", newAlerts[0].WindowEnd.Sub(newAlerts[0].WindowStart))
+	}
+	t.Logf("version pinning verified: old v1 alert=%+v; new v2 alert=%+v", a[0], newAlerts[0])
+}

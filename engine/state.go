@@ -2,6 +2,7 @@ package engine
 
 import (
 	"container/list"
+	"strings"
 	"sync/atomic"
 
 	"github.com/lisama569/event-correlation-engine-go/rules"
@@ -16,30 +17,56 @@ func (a *atomicRuleSet) Store(rs *rules.RuleSet) { a.v.Store(rs) }
 func (a *atomicRuleSet) Load() *rules.RuleSet    { return a.v.Load() }
 
 // windowState 单个窗口的计数状态。
+// 窗口首次创建时，其规则版本、阈值、窗口长度即被固定下来；
+// 后续规则热更新不会改动这些值，保证同一窗口始终按它开启时那一版规则判定。
 type windowState struct {
-	count   int
-	alerted bool                // 是否已触发告警（每窗口最多一次）
-	seen    map[string]struct{} // 事件 ID 去重，防止重复计数
+	start       int64 // windowStart.UnixNano()
+	count       int
+	alerted     bool                // 是否已触发告警（每窗口最多一次）
+	seen        map[string]struct{} // 事件 ID 去重，防止重复计数
+	ruleVersion int                 // 固定：开启窗口时的规则集版本
+	threshold   int                 // 固定：开启窗口时那一版规则的阈值
+	windowNanos int64               // 固定：开启窗口时那一版规则的窗口长度
 }
 
 // keyState 单个关联键（ruleID|groupKey）的窗口状态集合。
 type keyState struct {
 	stateKey string
+	ruleID   string                 // stateKey 中 '|' 之前的部分，便于生成报告
+	groupKey string                 // stateKey 中 '|' 之后的部分
 	windows  map[int64]*windowState // windowStart.UnixNano() -> 状态
 	elem     *list.Element          // 在 LRU 链表中的位置
 }
 
 func newKeyState(stateKey string) *keyState {
-	return &keyState{stateKey: stateKey, windows: make(map[int64]*windowState)}
+	ruleID, groupKey, _ := strings.Cut(stateKey, "|")
+	return &keyState{
+		stateKey: stateKey,
+		ruleID:   ruleID,
+		groupKey: groupKey,
+		windows:  make(map[int64]*windowState),
+	}
 }
 
-// add 在指定窗口中加入一个事件，返回 (新增计数, 是否重复)。
-func (ks *keyState) add(windowStart int64, eventID string) (int, bool) {
+// ensure 返回指定窗口的状态。窗口首次创建时，按传入的规则版本固定阈值与窗口长度；
+// 已存在的窗口原样返回，固定值不被后续版本覆盖。
+func (ks *keyState) ensure(windowStart int64, version, threshold int, windowNanos int64) *windowState {
 	ws, ok := ks.windows[windowStart]
 	if !ok {
-		ws = &windowState{seen: make(map[string]struct{})}
+		ws = &windowState{
+			start:       windowStart,
+			seen:        make(map[string]struct{}),
+			ruleVersion: version,
+			threshold:   threshold,
+			windowNanos: windowNanos,
+		}
 		ks.windows[windowStart] = ws
 	}
+	return ws
+}
+
+// addEvent 在窗口中加入一个事件，返回 (新增计数, 是否重复)。
+func (ws *windowState) addEvent(eventID string) (int, bool) {
 	if _, dup := ws.seen[eventID]; dup {
 		return ws.count, true
 	}
@@ -48,27 +75,17 @@ func (ks *keyState) add(windowStart int64, eventID string) (int, bool) {
 	return ws.count, false
 }
 
-// alerted 查询/设置窗口告警标记。
-func (ks *keyState) alerted(windowStart int64) bool {
-	if ws, ok := ks.windows[windowStart]; ok {
-		return ws.alerted
-	}
-	return false
-}
-
-func (ks *keyState) markAlerted(windowStart int64) {
-	if ws, ok := ks.windows[windowStart]; ok {
-		ws.alerted = true
-	}
-}
-
-// gcBefore 清理窗口结束时间 <= watermark 的已确认窗口。
-func (ks *keyState) gcBefore(watermark int64, windowNanos int64) {
-	for start := range ks.windows {
-		if start+windowNanos <= watermark {
+// gcSettled 清理结束时间 <= watermark 的已确认窗口（按每个窗口各自固定的窗口长度判定）。
+// 返回被清理掉的窗口，由上层决定是否需要暴露为淘汰报告。
+func (ks *keyState) gcSettled(watermark int64) []*windowState {
+	var removed []*windowState
+	for start, ws := range ks.windows {
+		if start+ws.windowNanos <= watermark {
 			delete(ks.windows, start)
+			removed = append(removed, ws)
 		}
 	}
+	return removed
 }
 
 // lruList 基于 container/list 的键 LRU，front 为最近使用。
